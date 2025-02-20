@@ -5,25 +5,31 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use pcap::{Capture, Device};
+use pnet::packet::{
+    ethernet::EthernetPacket, ip::IpNextHeaderProtocols, ipv4::Ipv4Packet, ipv6::Ipv6Packet, tcp::TcpPacket, udp::UdpPacket, Packet
+};
 use ratatui::{
     prelude::*,
     style::{Color, Modifier, Style},
     widgets::*,
 };
 use std::{
-    io::{self, Write},
+    fs,
+    io::{self, Read, Write},
+    path::Path,
     time::{Duration, Instant},
 };
 
 struct AppState {
     packets: Vec<String>,
-    start_time: Instant,
-    total_packets: usize,
-    packets_per_second: f64,
-    last_update: Instant,
+    starttime: Instant,
+    totalpackets: usize,
+    packetspersecond: f64,
+    lastupdate: Instant,
     devices: Vec<Device>,
-    selected_device: Option<usize>,
-    selection_made: bool,
+    selecteddevice: Option<usize>,
+    selectionmade: bool,
+    iscapturing: bool,
 }
 
 impl AppState {
@@ -35,50 +41,49 @@ impl AppState {
 
         Self {
             packets: Vec::new(),
-            start_time: Instant::now(),
-            total_packets: 0,
-            packets_per_second: 0.0,
-            last_update: Instant::now(),
+            starttime: Instant::now(),
+            totalpackets: 0,
+            packetspersecond: 0.0,
+            lastupdate: Instant::now(),
             devices,
-            selected_device: Some(0),
-            selection_made: false,
+            selecteddevice: Some(0),
+            selectionmade: false,
+            iscapturing: false,
         }
     }
 
-    fn update_stats(&mut self) {
-        self.total_packets += 1;
-        let elapsed = self.last_update.elapsed().as_secs_f64();
+    fn updatestats(&mut self) {
+        self.totalpackets += 1;
+        let elapsed = self.lastupdate.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
-            self.packets_per_second =
-                self.total_packets as f64 / self.start_time.elapsed().as_secs_f64();
-            self.last_update = Instant::now();
+            self.packetspersecond =
+                self.totalpackets as f64 / self.starttime.elapsed().as_secs_f64();
+            self.lastupdate = Instant::now();
         }
     }
 
-    fn select_next_device(&mut self) {
-        if let Some(current) = self.selected_device {
-            self.selected_device = Some((current + 1) % self.devices.len());
+    fn selectnextdevice(&mut self) {
+        if let Some(current) = self.selecteddevice {
+            self.selecteddevice = Some((current + 1) % self.devices.len());
         }
     }
 
-    fn select_previous_device(&mut self) {
-        if let Some(current) = self.selected_device {
-            self.selected_device = Some((current + self.devices.len() - 1) % self.devices.len());
+    fn selectpreviousdevice(&mut self) {
+        if let Some(current) = self.selecteddevice {
+            self.selecteddevice = Some((current + self.devices.len() - 1) % self.devices.len());
         }
     }
 
-    fn confirm_selection(&mut self) {
-        self.selection_made = true;
+    fn confirmselection(&mut self) {
+        self.selectionmade = true;
     }
 
-    fn get_selected_device(&self) -> Option<Device> {
-        self.selected_device.map(|idx| self.devices[idx].clone())
+    fn getselecteddevice(&self) -> Option<Device> {
+        self.selecteddevice.map(|idx| self.devices[idx].clone())
     }
 }
 
-fn setup_capture(device: Device, promisc: bool) -> Result<Capture<pcap::Active>, String> {
-    println!("Promiscuous mode: {}", promisc);
-
+fn setupcapture(device: Device, promisc: bool) -> Result<Capture<pcap::Active>, String> {
     Capture::from_device(device)
         .map_err(|e| format!("Failed to open device: {}", e))?
         .promisc(promisc)
@@ -88,7 +93,7 @@ fn setup_capture(device: Device, promisc: bool) -> Result<Capture<pcap::Active>,
         .map_err(|e| format!("Failed to start capture on device: {}", e))
 }
 
-fn parse_arguments() -> (bool, bool) {
+fn parsearguments() -> (bool, bool, String, bool) {
     let matches = App::new("Packet Capture")
         .version("1.0")
         .author("Ewan Clark <ewancclark@outlook.com>")
@@ -114,20 +119,39 @@ fn parse_arguments() -> (bool, bool) {
                 .help("Shows a graphical interface in the terminal")
                 .takes_value(false),
         )
+        .arg(
+            Arg::with_name("export")
+                .short("e")
+                .long("export")
+                .help("Export captured packets to a file")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("clear")
+                .short("c")
+                .long("clear")
+                .help("Clears the file before exporting")
+                .takes_value(false),
+        )
         .get_matches();
 
-    (matches.is_present("promisc"), matches.is_present("gui"))
+    (
+        matches.is_present("promisc"),
+        matches.is_present("gui"),
+        matches.value_of("export").unwrap_or("").to_string(),
+        matches.is_present("clear"),
+    )
 }
 
-fn draw_device_selection(frame: &mut Frame, app_state: &AppState) {
-    let area = centered_rect(60, 60, frame.area());
+fn drawdeviceselection(frame: &mut Frame, appstate: &AppState) {
+    let area = centeredrect(60, 60, frame.area());
 
-    let devices: Vec<ListItem> = app_state
+    let devices: Vec<ListItem> = appstate
         .devices
         .iter()
         .enumerate()
         .map(|(i, device)| {
-            let style = if Some(i) == app_state.selected_device {
+            let style = if Some(i) == appstate.selecteddevice {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -140,7 +164,7 @@ fn draw_device_selection(frame: &mut Frame, app_state: &AppState) {
         })
         .collect();
 
-    let devices_list = List::new(devices)
+    let deviceslist = List::new(devices)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -166,31 +190,31 @@ fn draw_device_selection(frame: &mut Frame, app_state: &AppState) {
         .split(area);
 
     frame.render_widget(Clear, area);
-    frame.render_widget(devices_list, layout[0]);
+    frame.render_widget(deviceslist, layout[0]);
     frame.render_widget(instructions, layout[1]);
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
+fn centeredrect(percentx: u16, percenty: u16, r: Rect) -> Rect {
+    let popuplayout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage((100 - percenty) / 2),
+            Constraint::Percentage(percenty),
+            Constraint::Percentage((100 - percenty) / 2),
         ])
         .split(r);
 
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage((100 - percentx) / 2),
+            Constraint::Percentage(percentx),
+            Constraint::Percentage((100 - percentx) / 2),
         ])
-        .split(popup_layout[1])[1]
+        .split(popuplayout[1])[1]
 }
 
-fn setup_tui() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+fn setuptui() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -198,13 +222,90 @@ fn setup_tui() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     Terminal::new(backend)
 }
 
-fn update_tui(
+fn parsepacket(packetdata: &[u8], packetnumber: usize) -> String {
+    if let Some(ethernet) = EthernetPacket::new(packetdata) {
+        match ethernet.get_ethertype() {
+            pnet::packet::ethernet::EtherTypes::Ipv4 => {
+                if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
+                    match ipv4.get_next_level_protocol() {
+                        IpNextHeaderProtocols::Tcp => {
+                            if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+                                return format!(
+                                    "[{}] IPv4 TCP | SRC: {}:{} | DST: {}:{} | FLAGS: {:?} | LEN: {}",
+                                    packetnumber,
+                                    ipv4.get_source(),
+                                    tcp.get_source(),
+                                    ipv4.get_destination(),
+                                    tcp.get_destination(),
+                                    tcp.get_flags(),
+                                    packetdata.len()
+                                );
+                            }
+                        }
+                        IpNextHeaderProtocols::Udp => {
+                            if let Some(udp) = UdpPacket::new(ipv4.payload()) {
+                                return format!(
+                                    "[{}] IPv4 UDP | SRC: {}:{} | DST: {}:{} | LEN: {}",
+                                    packetnumber,
+                                    ipv4.get_source(),
+                                    udp.get_source(),
+                                    ipv4.get_destination(),
+                                    udp.get_destination(),
+                                    packetdata.len()
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            pnet::packet::ethernet::EtherTypes::Ipv6 => {
+                if let Some(ipv6) = Ipv6Packet::new(ethernet.payload()) {
+                    match ipv6.get_next_header() {
+                        IpNextHeaderProtocols::Tcp => {
+                            if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
+                                return format!(
+                                    "[{}] IPv6 TCP | SRC: {}:{} | DST: {}:{} | FLAGS: {:?} | LEN: {}",
+                                    packetnumber,
+                                    ipv6.get_source(),
+                                    tcp.get_source(),
+                                    ipv6.get_destination(),
+                                    tcp.get_destination(),
+                                    tcp.get_flags(),
+                                    packetdata.len()
+                                );
+                            }
+                        }
+                        IpNextHeaderProtocols::Udp => {
+                            if let Some(udp) = UdpPacket::new(ipv6.payload()) {
+                                return format!(
+                                    "[{}] IPv6 UDP | SRC: {}:{} | DST: {}:{} | LEN: {}",
+                                    packetnumber,
+                                    ipv6.get_source(),
+                                    udp.get_source(),
+                                    ipv6.get_destination(),
+                                    udp.get_destination(),
+                                    packetdata.len()
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    format!("[{}] Unknown Packet | LEN: {}", packetnumber, packetdata.len())
+}
+
+fn updatetui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app_state: &AppState,
+    appstate: &AppState,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
-        if !app_state.selection_made {
-            draw_device_selection(frame, app_state);
+        if !appstate.selectionmade {
+            drawdeviceselection(frame, appstate);
             return;
         }
 
@@ -231,8 +332,8 @@ fn update_tui(
             );
         frame.render_widget(header, chunks[0]);
 
-        let packets = app_state.packets.iter().cloned().collect::<Vec<_>>();
-        let packets_list = Paragraph::new(packets.join("\n"))
+        let packets = appstate.packets.iter().cloned().collect::<Vec<_>>();
+        let packetslist = Paragraph::new(packets.join("\n"))
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
@@ -241,15 +342,15 @@ fn update_tui(
                     .title(" Captured Packets ")
                     .title_alignment(Alignment::Left),
             );
-        frame.render_widget(packets_list, chunks[1]);
+        frame.render_widget(packetslist, chunks[1]);
 
         let stats = format!(
             "Total Packets: {} | Packets/sec: {:.2} | Running Time: {:?}",
-            app_state.total_packets,
-            app_state.packets_per_second,
-            app_state.start_time.elapsed().as_secs()
+            appstate.totalpackets,
+            appstate.packetspersecond,
+            appstate.starttime.elapsed().as_secs()
         );
-        let stats_widget = Paragraph::new(stats)
+        let statswidget = Paragraph::new(stats)
             .style(Style::default().fg(Color::Green))
             .block(
                 Block::default()
@@ -258,9 +359,13 @@ fn update_tui(
                     .title(" Statistics ")
                     .title_alignment(Alignment::Left),
             );
-        frame.render_widget(stats_widget, chunks[2]);
-
-        let footer = Paragraph::new("Press 'q' or Ctrl+C to quit")
+        frame.render_widget(statswidget, chunks[2]);
+        let footertext = if appstate.iscapturing {
+            "Press 's' to stop capturing | 'q' or Ctrl+C to quit"
+        } else {
+            "Press 's' to start capturing | 'q' or Ctrl+C to quit"
+        };
+        let footer = Paragraph::new(footertext)
             .style(Style::default().fg(Color::Yellow))
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[3]);
@@ -269,7 +374,7 @@ fn update_tui(
     Ok(())
 }
 
-fn cleanup_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+fn cleanuptui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -280,7 +385,7 @@ fn cleanup_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Res
     Ok(())
 }
 
-fn select_device() -> Device {
+fn selectdevice() -> Device {
     let devices = Device::list().unwrap_or_else(|e| {
         eprintln!("Error listing devices: {}", e);
         std::process::exit(1);
@@ -297,7 +402,7 @@ fn select_device() -> Device {
     io::stdin().read_line(&mut input).unwrap();
 
     let input: usize = input.trim().parse().unwrap_or_else(|_| {
-        println!("Invalid input! Please enter a valid number.");
+        eprintln!("Invalid input! Please enter a valid number.");
         std::process::exit(1);
     });
 
@@ -307,20 +412,111 @@ fn select_device() -> Device {
     })
 }
 
+fn checkandprepareexportlocation(exportlocation: &str, clearfile: bool) -> io::Result<String> {
+    let path = Path::new(exportlocation);
+
+    // Check if the parent directory exists
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            eprintln!("Error: The parent directory does not exist: {:?}", parent);
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!("Error: The export location has no parent directory.");
+        std::process::exit(1);
+    }
+
+    // If the path is a directory, treat it as invalid (we expect a file path)
+    if path.is_dir() {
+        eprintln!("Error: The export location is a directory. Please specify a file path.");
+        std::process::exit(1);
+    }
+
+    // If the file doesn't exist, create it
+    if !path.exists() {
+        fs::File::create(&path)?;
+    }
+
+    // Ensure the file is writable
+    let file = fs::OpenOptions::new().write(true).open(path);
+    if file.is_err() {
+        eprintln!("Error: The specified file is not writable.");
+        std::process::exit(1);
+    }
+
+    // Clear the file if `clearfile` is true
+    if clearfile {
+        fs::write(&path, "")?; // Overwrite the file with an empty string
+    }
+
+    // Return the file path as a String
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn exportdata(exportlocation: &str, data: &str) -> io::Result<()> {
+    // Read the existing file content (if the file exists)
+    let mut existingcontent = String::new();
+    if Path::new(exportlocation).exists() {
+        let mut file = fs::File::open(exportlocation)?;
+        file.read_to_string(&mut existingcontent)?;
+    }
+
+    // Open the file for writing (this will truncate the file)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(exportlocation)?;
+
+    // Write the new data followed by the existing content
+    writeln!(file, "{}", data)?;
+    write!(file, "{}", existingcontent)?;
+
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
-    let args = parse_arguments();
+    let args = parsearguments();
     let promisc = args.0;
     let enablegui = args.1;
+    let mut exportlocation = args.2;
+    let clearfile = args.3;
 
-    let mut app_state = AppState::new();
+    if exportlocation != "" {
+        match checkandprepareexportlocation(&exportlocation, clearfile) {
+            Ok(path) => {
+                exportlocation = path.clone();
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        if clearfile {
+            eprintln!("Error: The --clear flag requires the --export flag to be set.");
+            std::process::exit(1);
+        }
+    }
+
+    let mut appstate = AppState::new();
 
     if !enablegui {
-        let device = select_device();
-        match setup_capture(device, promisc) {
+        let device = selectdevice();
+        match setupcapture(device, promisc) {
             Ok(mut capture) => {
                 println!("Sniffing on device... Press Ctrl+C to stop.");
                 while let Ok(packet) = capture.next_packet() {
-                    println!("Captured {} bytes", packet.header.len);
+                    let packetinfo = parsepacket(&packet.data, appstate.totalpackets);
+                    appstate.packets.insert(0, packetinfo.clone());
+                    appstate.updatestats();
+
+                    if appstate.packets.len() > 100 {
+                        appstate.packets.pop();
+                    }
+
+                    println!("{}", packetinfo);
+                    exportdata(&exportlocation, &packetinfo)?;
                 }
             }
             Err(e) => eprintln!("Error: {}", e),
@@ -328,27 +524,28 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut terminal = setup_tui()?;
+    let mut terminal = setuptui()?;
 
     'outer: loop {
-        update_tui(&mut terminal, &app_state)?;
+        updatetui(&mut terminal, &appstate)?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Up if !app_state.selection_made => app_state.select_previous_device(),
-                    KeyCode::Down if !app_state.selection_made => app_state.select_next_device(),
-                    KeyCode::Enter if !app_state.selection_made => {
-                        app_state.confirm_selection();
+                    KeyCode::Up if !appstate.selectionmade => appstate.selectpreviousdevice(),
+                    KeyCode::Down if !appstate.selectionmade => appstate.selectnextdevice(),
+                    KeyCode::Enter if !appstate.selectionmade => {
+                        appstate.confirmselection();
 
-                        if let Some(device) = app_state.get_selected_device() {
-                            match setup_capture(device, promisc) {
+                        if let Some(device) = appstate.getselecteddevice() {
+                            match setupcapture(device, promisc) {
                                 Ok(capture) => {
                                     let mut capture = capture.setnonblock().unwrap();
 
-                                    app_state.start_time = Instant::now();
+                                    appstate.starttime = Instant::now();
+                                    appstate.iscapturing = true; // Start capturing
 
                                     'capture: loop {
                                         if event::poll(Duration::from_millis(1))? {
@@ -362,34 +559,45 @@ fn main() -> io::Result<()> {
                                                     {
                                                         break 'outer
                                                     }
+                                                    KeyCode::Char('s') => {
+                                                        appstate.iscapturing =
+                                                            !appstate.iscapturing;
+                                                        updatetui(&mut terminal, &appstate)?;
+                                                    }
                                                     _ => {}
                                                 }
                                             }
                                         }
 
-                                        match capture.next_packet() {
-                                            Ok(packet) => {
-                                                let packet_info = format!(
-                                                    "[{}] Captured {} bytes",
-                                                    app_state.total_packets + 1,
-                                                    packet.header.len
-                                                );
-                                                app_state.packets.insert(0, packet_info);
-                                                app_state.update_stats();
+                                        if appstate.iscapturing {
+                                            match capture.next_packet() {
+                                                Ok(packet) => {
+                                                    let packetinfo = parsepacket(&packet.data, appstate.totalpackets);
+                                                    appstate
+                                                        .packets
+                                                        .insert(0, packetinfo.clone());
+                                                    exportdata(
+                                                        &exportlocation,
+                                                        &packetinfo.clone(),
+                                                    )?;
+                                                    appstate.updatestats();
 
-                                                if app_state.packets.len() > 100 {
-                                                    app_state.packets.pop();
+                                                    if appstate.packets.len() > 100 {
+                                                        appstate.packets.pop();
+                                                    }
+
+                                                    updatetui(&mut terminal, &appstate)?;
                                                 }
-
-                                                update_tui(&mut terminal, &app_state)?;
+                                                Err(pcap::Error::TimeoutExpired) => {
+                                                    updatetui(&mut terminal, &appstate)?;
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("Error capturing packet: {}", e);
+                                                    break 'capture;
+                                                }
                                             }
-                                            Err(pcap::Error::TimeoutExpired) => {
-                                                update_tui(&mut terminal, &app_state)?;
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Error capturing packet: {}", e);
-                                                break 'capture;
-                                            }
+                                        } else {
+                                            updatetui(&mut terminal, &appstate)?;
                                         }
                                     }
                                 }
@@ -406,6 +614,6 @@ fn main() -> io::Result<()> {
         }
     }
 
-    cleanup_tui(&mut terminal)?;
+    cleanuptui(&mut terminal)?;
     Ok(())
 }
