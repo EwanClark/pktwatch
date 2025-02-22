@@ -6,7 +6,13 @@ use crossterm::{
 };
 use pcap::{Capture, Device};
 use pnet::packet::{
-    ethernet::EthernetPacket, ip::IpNextHeaderProtocols, ipv4::Ipv4Packet, ipv6::Ipv6Packet, tcp::TcpPacket, udp::UdpPacket, Packet
+    ethernet::{EtherTypes, EthernetPacket},
+    ip::IpNextHeaderProtocols,
+    ipv4::Ipv4Packet,
+    ipv6::Ipv6Packet,
+    tcp::TcpPacket,
+    udp::UdpPacket,
+    Packet,
 };
 use ratatui::{
     prelude::*,
@@ -15,7 +21,7 @@ use ratatui::{
 };
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::Path,
     time::{Duration, Instant},
 };
@@ -30,6 +36,19 @@ struct AppState {
     selecteddevice: Option<usize>,
     selectionmade: bool,
     iscapturing: bool,
+    filters: Vec<Filter>,
+}
+
+#[derive(Clone)]
+enum FilterType {
+    Include,
+    Exclude,
+}
+
+#[derive(Clone)]
+struct Filter {
+    pattern: String,
+    filter_type: FilterType,
 }
 
 impl AppState {
@@ -49,6 +68,7 @@ impl AppState {
             selecteddevice: Some(0),
             selectionmade: false,
             iscapturing: false,
+            filters: Vec::new(),
         }
     }
 
@@ -81,21 +101,87 @@ impl AppState {
     fn getselecteddevice(&self) -> Option<Device> {
         self.selecteddevice.map(|idx| self.devices[idx].clone())
     }
+
+    fn should_display_packet(&self, packet_info: &str) -> bool {
+        if self.filters.is_empty() {
+            return true; // No filters, display all packets
+        }
+    
+        let packet_info_lower = packet_info.to_lowercase();
+    
+        // Check exclude filters first
+        for filter in &self.filters {
+            if let FilterType::Exclude = filter.filter_type {
+                if packet_info_lower.contains(&filter.pattern.to_lowercase()) {
+                    return false; // Exclude if it matches any exclude filter
+                }
+            }
+        }
+    
+        // If there are no include filters, display the packet
+        let has_include_filters = self.filters.iter().any(|f| matches!(f.filter_type, FilterType::Include));
+        if !has_include_filters {
+            return true;
+        }
+    
+        // Check include filters
+        for filter in &self.filters {
+            if let FilterType::Include = filter.filter_type {
+                if packet_info_lower.contains(&filter.pattern.to_lowercase()) {
+                    return true; // Include if it matches any include filter
+                }
+            }
+        }
+    
+        false // If no include filters match, exclude the packet
+    }
 }
 
-fn setupcapture(device: Device, promisc: bool) -> Result<Capture<pcap::Active>, String> {
-    Capture::from_device(device)
-        .map_err(|e| format!("Failed to open device: {}", e))?
+// Modify the setupcapture function to always show errors
+fn setupcapture(device: Device, promisc: bool, verbose: bool) -> Result<Capture<pcap::Active>, String> {
+    if verbose {
+        println!("Setting up capture on device: {}", device.name);
+        println!("Promiscuous mode: {}", promisc);
+    }
+
+    let device_name = device.name.clone();
+    let capture = Capture::from_device(device)
+        .map_err(|e| format!("Failed to open device '{}': {}", device_name, e))?
         .promisc(promisc)
         .immediate_mode(true)
         .snaplen(65535)
         .open()
-        .map_err(|e| format!("Failed to start capture on device: {}", e))
+        .map_err(|e| format!("Failed to start capture on device '{}': {}", device_name, e))?;
+    Ok(capture)
 }
 
-fn parsearguments() -> (bool, bool, String, bool) {
+fn selectdevice(devices: &[Device]) -> Device {
+    println!("Available devices:");
+    for (i, device) in devices.iter().enumerate() {
+        println!("{}. {}", i + 1, device.name);
+    }
+
+    let mut input = String::new();
+    print!("Select a device to capture (1-{}): ", devices.len());
+    io::stdout().flush().unwrap();
+    io::stdin().read_line(&mut input).unwrap();
+
+    let input: usize = input.trim().parse().unwrap_or_else(|_| {
+        eprintln!("Invalid input! Please enter a valid number.");
+        std::process::exit(1);
+    });
+
+    if input < 1 || input > devices.len() {
+        eprintln!("Invalid device selection!");
+        std::process::exit(1);
+    }
+
+    devices[input - 1].clone()
+}
+
+fn parsearguments() -> (bool, bool, String, bool, bool, bool, String) {
     let matches = App::new("Packet Capture")
-        .version("1.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Ewan Clark <ewancclark@outlook.com>")
         .about("Capture packets from network devices")
         .arg(
@@ -106,32 +192,52 @@ fn parsearguments() -> (bool, bool, String, bool) {
                 .takes_value(false),
         )
         .arg(
+            Arg::with_name("gui")
+            .short("g")
+            .long("gui")
+            .help("Shows a graphical interface in the terminal")
+            .takes_value(false),
+        )
+        .arg(
+            Arg::with_name("export")
+            .short("e")
+            .long("export")
+            .help("Export captured packets to a file")
+            .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("clear")
+            .short("c")
+            .long("clear")
+            .help("Clears the file before exporting")
+            .takes_value(false),
+        )
+        .arg(
+            Arg::with_name("verbose")
+            .short("v")
+            .long("verbose")
+            .help("Enable verbose output")
+            .takes_value(false),
+        )
+        .arg(
             Arg::with_name("version")
-                .short("v")
+                .short("V")
                 .long("version")
                 .help("Show version information")
                 .takes_value(false),
         )
         .arg(
-            Arg::with_name("gui")
-                .short("g")
-                .long("gui")
-                .help("Shows a graphical interface in the terminal")
-                .takes_value(false),
-        )
-        .arg(
-            Arg::with_name("export")
-                .short("e")
-                .long("export")
-                .help("Export captured packets to a file")
+            Arg::with_name("filter")
+                .short("f")
+                .long("filter")
+                .help(
+                    "Filter packets using patterns (semicolon-separated). \
+                     Include with pattern, exclude with !pattern.\n\
+                     Example: -f \"TCP;!192.168.1.1;!UDP\"\n\
+                     This shows all TCP packets except those containing UDP or 192.168.1.1\n\
+                     Filters are applied in order: includes first, then excludes."
+                )
                 .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("clear")
-                .short("c")
-                .long("clear")
-                .help("Clears the file before exporting")
-                .takes_value(false),
         )
         .get_matches();
 
@@ -140,6 +246,9 @@ fn parsearguments() -> (bool, bool, String, bool) {
         matches.is_present("gui"),
         matches.value_of("export").unwrap_or("").to_string(),
         matches.is_present("clear"),
+        matches.is_present("verbose"),
+        matches.is_present("version"),
+        matches.value_of("filter").unwrap_or("").to_string(),
     )
 }
 
@@ -222,16 +331,53 @@ fn setuptui() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     Terminal::new(backend)
 }
 
-fn parsepacket(packetdata: &[u8], packetnumber: usize) -> String {
+fn parsepacket(packetdata: &[u8], packetnumber: usize, verbose: bool) -> String {
     if let Some(ethernet) = EthernetPacket::new(packetdata) {
+        if verbose {
+            println!(
+                "[Packet {}] Ethernet | SRC: {:02X?} | DST: {:02X?} | Type: {:?}",
+                packetnumber,
+                ethernet.get_source(),
+                ethernet.get_destination(),
+                ethernet.get_ethertype()
+            );
+        }
+
         match ethernet.get_ethertype() {
-            pnet::packet::ethernet::EtherTypes::Ipv4 => {
+            EtherTypes::Ipv4 => {
                 if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
+                    if verbose {
+                        println!(
+                            "[Packet {}] IPv4 | SRC: {} | DST: {} | Protocol: {:?} | \
+                             TTL: {} | LEN: {}",
+                            packetnumber,
+                            ipv4.get_source(),
+                            ipv4.get_destination(),
+                            ipv4.get_next_level_protocol(),
+                            ipv4.get_ttl(),
+                            ipv4.get_total_length()
+                        );
+                    }
+
                     match ipv4.get_next_level_protocol() {
                         IpNextHeaderProtocols::Tcp => {
                             if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+                                if verbose {
+                                    println!(
+                                        "[Packet {}] TCP | SRC Port: {} | DST Port: {} | Flags: {:?} | SEQ: {} | ACK: {} | Window: {}",
+                                        packetnumber,
+                                        tcp.get_source(),
+                                        tcp.get_destination(),
+                                        tcp.get_flags(),
+                                        tcp.get_sequence(),
+                                        tcp.get_acknowledgement(),
+                                        tcp.get_window()
+                                    );
+                                }
+
                                 return format!(
-                                    "[{}] IPv4 TCP | SRC: {}:{} | DST: {}:{} | FLAGS: {:?} | LEN: {}",
+                                    "[{}] IPv4 TCP | SRC: {}:{} | DST: {}:{} | \
+                                     FLAGS: {:?} | LEN: {}",
                                     packetnumber,
                                     ipv4.get_source(),
                                     tcp.get_source(),
@@ -244,6 +390,16 @@ fn parsepacket(packetdata: &[u8], packetnumber: usize) -> String {
                         }
                         IpNextHeaderProtocols::Udp => {
                             if let Some(udp) = UdpPacket::new(ipv4.payload()) {
+                                if verbose {
+                                    println!(
+                                        "[Packet {}] UDP | SRC Port: {} | DST Port: {} | LEN: {}",
+                                        packetnumber,
+                                        udp.get_source(),
+                                        udp.get_destination(),
+                                        udp.get_length()
+                                    );
+                                }
+
                                 return format!(
                                     "[{}] IPv4 UDP | SRC: {}:{} | DST: {}:{} | LEN: {}",
                                     packetnumber,
@@ -259,11 +415,36 @@ fn parsepacket(packetdata: &[u8], packetnumber: usize) -> String {
                     }
                 }
             }
-            pnet::packet::ethernet::EtherTypes::Ipv6 => {
+            EtherTypes::Ipv6 => {
                 if let Some(ipv6) = Ipv6Packet::new(ethernet.payload()) {
+                    if verbose {
+                        println!(
+                            "[Packet {}] IPv6 | SRC: {} | DST: {} | Protocol: {:?} | Hop Limit: {} | LEN: {}",
+                            packetnumber,
+                            ipv6.get_source(),
+                            ipv6.get_destination(),
+                            ipv6.get_next_header(),
+                            ipv6.get_hop_limit(),
+                            ipv6.get_payload_length()
+                        );
+                    }
+
                     match ipv6.get_next_header() {
                         IpNextHeaderProtocols::Tcp => {
                             if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
+                                if verbose {
+                                    println!(
+                                        "[Packet {}] TCP | SRC Port: {} | DST Port: {} | Flags: {:?} | SEQ: {} | ACK: {} | Window: {}",
+                                        packetnumber,
+                                        tcp.get_source(),
+                                        tcp.get_destination(),
+                                        tcp.get_flags(),
+                                        tcp.get_sequence(),
+                                        tcp.get_acknowledgement(),
+                                        tcp.get_window()
+                                    );
+                                }
+
                                 return format!(
                                     "[{}] IPv6 TCP | SRC: {}:{} | DST: {}:{} | FLAGS: {:?} | LEN: {}",
                                     packetnumber,
@@ -278,6 +459,16 @@ fn parsepacket(packetdata: &[u8], packetnumber: usize) -> String {
                         }
                         IpNextHeaderProtocols::Udp => {
                             if let Some(udp) = UdpPacket::new(ipv6.payload()) {
+                                if verbose {
+                                    println!(
+                                        "[Packet {}] UDP | SRC Port: {} | DST Port: {} | LEN: {}",
+                                        packetnumber,
+                                        udp.get_source(),
+                                        udp.get_destination(),
+                                        udp.get_length()
+                                    );
+                                }
+
                                 return format!(
                                     "[{}] IPv6 UDP | SRC: {}:{} | DST: {}:{} | LEN: {}",
                                     packetnumber,
@@ -385,94 +576,92 @@ fn cleanuptui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     Ok(())
 }
 
-fn selectdevice() -> Device {
-    let devices = Device::list().unwrap_or_else(|e| {
-        eprintln!("Error listing devices: {}", e);
-        std::process::exit(1);
-    });
-
-    println!("Available devices:");
-    for (i, device) in devices.iter().enumerate() {
-        println!("{}. {}", i + 1, device.name);
-    }
-
-    let mut input = String::new();
-    print!("Select a device to capture: ");
-    io::stdout().flush().unwrap();
-    io::stdin().read_line(&mut input).unwrap();
-
-    let input: usize = input.trim().parse().unwrap_or_else(|_| {
-        eprintln!("Invalid input! Please enter a valid number.");
-        std::process::exit(1);
-    });
-
-    devices.get(input - 1).cloned().unwrap_or_else(|| {
-        eprintln!("Invalid device selection!");
-        std::process::exit(1);
-    })
-}
-
-fn checkandprepareexportlocation(exportlocation: &str, clearfile: bool) -> io::Result<String> {
+// Modify the checkandprepareexportlocation function to always show errors
+fn checkandprepareexportlocation(exportlocation: &str, clearfile: bool, verbose: bool) -> io::Result<String> {
     let path = Path::new(exportlocation);
 
-    // Check if the parent directory exists
+    if verbose {
+        println!("Checking export location: {}", exportlocation);
+    }
+
     if let Some(parent) = path.parent() {
         if !parent.exists() {
-            eprintln!("Error: The parent directory does not exist: {:?}", parent);
-            std::process::exit(1);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Parent directory does not exist: {:?}", parent)
+            ));
         }
-    } else {
-        eprintln!("Error: The export location has no parent directory.");
-        std::process::exit(1);
     }
 
-    // If the path is a directory, treat it as invalid (we expect a file path)
     if path.is_dir() {
-        eprintln!("Error: The export location is a directory. Please specify a file path.");
-        std::process::exit(1);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Export location is a directory, please specify a file path"
+        ));
     }
 
-    // If the file doesn't exist, create it
     if !path.exists() {
+        if verbose {
+            println!("Creating file: {:?}", path);
+        }
         fs::File::create(&path)?;
     }
 
-    // Ensure the file is writable
-    let file = fs::OpenOptions::new().write(true).open(path);
-    if file.is_err() {
-        eprintln!("Error: The specified file is not writable.");
-        std::process::exit(1);
-    }
+    fs::OpenOptions::new().write(true).open(path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("File is not writable: {}", e)
+        )
+    })?;
 
-    // Clear the file if `clearfile` is true
     if clearfile {
-        fs::write(&path, "")?; // Overwrite the file with an empty string
+        if verbose {
+            println!("Clearing file: {:?}", path);
+        }
+        fs::write(&path, "")?;
     }
 
-    // Return the file path as a String
+    if verbose {
+        println!("Export location prepared: {:?}", path);
+    }
+
     Ok(path.to_string_lossy().into_owned())
 }
 
 fn exportdata(exportlocation: &str, data: &str) -> io::Result<()> {
-    // Read the existing file content (if the file exists)
-    let mut existingcontent = String::new();
-    if Path::new(exportlocation).exists() {
-        let mut file = fs::File::open(exportlocation)?;
-        file.read_to_string(&mut existingcontent)?;
-    }
-
-    // Open the file for writing (this will truncate the file)
     let mut file = fs::OpenOptions::new()
         .write(true)
+        .append(true)
         .create(true)
-        .truncate(true)
         .open(exportlocation)?;
 
-    // Write the new data followed by the existing content
     writeln!(file, "{}", data)?;
-    write!(file, "{}", existingcontent)?;
-
     Ok(())
+}
+
+fn parse_filters(filter_str: &str) -> Vec<Filter> {
+    if filter_str.is_empty() {
+        return Vec::new();
+    }
+
+    filter_str
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .map(|pattern| {
+            let pattern = pattern.trim();
+            if pattern.starts_with('!') {
+                Filter {
+                    pattern: pattern[1..].to_string(),
+                    filter_type: FilterType::Exclude,
+                }
+            } else {
+                Filter {
+                    pattern: pattern.to_string(),
+                    filter_type: FilterType::Include,
+                }
+            }
+        })
+        .collect()
 }
 
 fn main() -> io::Result<()> {
@@ -481,9 +670,31 @@ fn main() -> io::Result<()> {
     let enablegui = args.1;
     let mut exportlocation = args.2;
     let clearfile = args.3;
+    let verbose = args.4;
+    let version = args.5;
+    let filter_str = args.6;
 
-    if exportlocation != "" {
-        match checkandprepareexportlocation(&exportlocation, clearfile) {
+    if version {
+        println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // Ensure GUI mode and verbose mode are not used together
+    if enablegui && verbose {
+        eprintln!("Error: Verbose mode (-v) cannot be used with GUI mode (-g)");
+        std::process::exit(1);
+    }
+
+    if verbose {
+        println!("Starting packet capture with the following options:");
+        println!("Promiscuous mode: {}", promisc);
+        println!("GUI mode: {}", enablegui);
+        println!("Export location: {}", exportlocation);
+        println!("Clear file: {}", clearfile);
+    }
+
+    if !exportlocation.is_empty() {
+        match checkandprepareexportlocation(&exportlocation, clearfile, verbose) {
             Ok(path) => {
                 exportlocation = path.clone();
             }
@@ -492,31 +703,48 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             }
         }
-    } else {
-        if clearfile {
-            eprintln!("Error: The --clear flag requires the --export flag to be set.");
-            std::process::exit(1);
-        }
+    } else if clearfile {
+        eprintln!("Error: The --clear flag requires the --export flag to be set.");
+        std::process::exit(1);
     }
 
     let mut appstate = AppState::new();
+    appstate.filters = parse_filters(&filter_str);
+
+    if verbose && !filter_str.is_empty() {
+        println!("Applied filters:");
+        for filter in &appstate.filters {
+            match filter.filter_type {
+                FilterType::Include => println!("Include: {}", filter.pattern),
+                FilterType::Exclude => println!("Exclude: !{}", filter.pattern),
+            }
+        }
+    }
 
     if !enablegui {
-        let device = selectdevice();
-        match setupcapture(device, promisc) {
+        let device = selectdevice(&appstate.devices); // Allow device selection in non-GUI mode
+        match setupcapture(device, promisc, verbose) {
             Ok(mut capture) => {
                 println!("Sniffing on device... Press Ctrl+C to stop.");
                 while let Ok(packet) = capture.next_packet() {
-                    let packetinfo = parsepacket(&packet.data, appstate.totalpackets);
-                    appstate.packets.insert(0, packetinfo.clone());
-                    appstate.updatestats();
+                    let packetinfo = parsepacket(&packet.data, appstate.totalpackets, verbose);
+                    if appstate.should_display_packet(&packetinfo) {
+                        appstate.packets.insert(0, packetinfo.clone());
+                        appstate.updatestats();
 
-                    if appstate.packets.len() > 100 {
-                        appstate.packets.pop();
+                        if appstate.packets.len() > 100 {
+                            appstate.packets.pop();
+                        }
+
+                        if verbose {
+                            println!("Captured packet: {}", packetinfo);
+                        }
+
+                        println!("{}", packetinfo);
+                        if !exportlocation.is_empty() {
+                            exportdata(&exportlocation, &packetinfo)?;
+                        }
                     }
-
-                    println!("{}", packetinfo);
-                    exportdata(&exportlocation, &packetinfo)?;
                 }
             }
             Err(e) => eprintln!("Error: {}", e),
@@ -540,12 +768,12 @@ fn main() -> io::Result<()> {
                         appstate.confirmselection();
 
                         if let Some(device) = appstate.getselecteddevice() {
-                            match setupcapture(device, promisc) {
+                            match setupcapture(device, promisc, verbose) {
                                 Ok(capture) => {
                                     let mut capture = capture.setnonblock().unwrap();
 
                                     appstate.starttime = Instant::now();
-                                    appstate.iscapturing = true; // Start capturing
+                                    appstate.iscapturing = true;
 
                                     'capture: loop {
                                         if event::poll(Duration::from_millis(1))? {
@@ -553,15 +781,12 @@ fn main() -> io::Result<()> {
                                                 match key.code {
                                                     KeyCode::Char('q') => break 'outer,
                                                     KeyCode::Char('c')
-                                                        if key
-                                                            .modifiers
-                                                            .contains(KeyModifiers::CONTROL) =>
+                                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                                     {
                                                         break 'outer
                                                     }
                                                     KeyCode::Char('s') => {
-                                                        appstate.iscapturing =
-                                                            !appstate.iscapturing;
+                                                        appstate.iscapturing = !appstate.iscapturing;
                                                         updatetui(&mut terminal, &appstate)?;
                                                     }
                                                     _ => {}
@@ -572,21 +797,22 @@ fn main() -> io::Result<()> {
                                         if appstate.iscapturing {
                                             match capture.next_packet() {
                                                 Ok(packet) => {
-                                                    let packetinfo = parsepacket(&packet.data, appstate.totalpackets);
-                                                    appstate
-                                                        .packets
-                                                        .insert(0, packetinfo.clone());
-                                                    exportdata(
-                                                        &exportlocation,
-                                                        &packetinfo.clone(),
-                                                    )?;
-                                                    appstate.updatestats();
+                                                    let packetinfo = parsepacket(&packet.data, appstate.totalpackets, verbose);
+                                                    if appstate.should_display_packet(&packetinfo) {
+                                                        appstate.packets.insert(0, packetinfo.clone());
+                                                        if !exportlocation.is_empty() {
+                                                            if let Err(e) = exportdata(&exportlocation, &packetinfo) {
+                                                                eprintln!("Failed to export packet data: {}", e);
+                                                            }
+                                                        }
+                                                        appstate.updatestats();
 
-                                                    if appstate.packets.len() > 100 {
-                                                        appstate.packets.pop();
+                                                        if appstate.packets.len() > 100 {
+                                                            appstate.packets.pop();
+                                                        }
+
+                                                        updatetui(&mut terminal, &appstate)?;
                                                     }
-
-                                                    updatetui(&mut terminal, &appstate)?;
                                                 }
                                                 Err(pcap::Error::TimeoutExpired) => {
                                                     updatetui(&mut terminal, &appstate)?;

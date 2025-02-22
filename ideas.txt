@@ -1,2 +1,0 @@
-filter ips or really anything i want
-add a move verbose option
