@@ -85,12 +85,10 @@ pktwatch is a network packet capture tool that allows you to monitor and analyze
 
 Capture packets in promiscuous mode and export them to a file:
 
-    ```sh
     pktwatch -p -e packets.txt
-    ```
+    
 
 Run in GUI mode:
 
-    ```sh
     pktwatch -g
-    ```
+    
